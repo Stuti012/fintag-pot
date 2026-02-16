@@ -1,3 +1,4 @@
+from collections import Counter
 from typing import List, Tuple, Optional
 from indexing.schema import FinQAExample, RetrievalResult
 from llm.llm_client import LLMClient
@@ -97,6 +98,57 @@ class ProgramGenerator:
             return program, reasoning, True, None
         
         return "", "", False, "Max retry attempts reached"
+
+    def generate_with_self_consistency(
+        self,
+        question: str,
+        retrieved_evidence: List[RetrievalResult],
+        available_numbers: List[float],
+        n_samples: int = 5,
+    ) -> Tuple[str, str, bool, Optional[str]]:
+        """Generate multiple candidate programs and pick answer by majority vote."""
+        successful_runs = []
+        errors = []
+
+        for _ in range(max(1, n_samples)):
+            program, reasoning, success, error = self.generate_with_repair(
+                question=question,
+                retrieved_evidence=retrieved_evidence,
+                available_numbers=available_numbers,
+            )
+
+            if not success:
+                if error:
+                    errors.append(error)
+                continue
+
+            final_answer, _, exec_error = self.executor.execute(program)
+            if exec_error:
+                errors.append(exec_error)
+                continue
+
+            successful_runs.append(
+                {
+                    'program': program,
+                    'reasoning': reasoning,
+                    'answer': final_answer,
+                }
+            )
+
+        if not successful_runs:
+            error_message = errors[0] if errors else "Self-consistency generation failed"
+            return "", "", False, error_message
+
+        answer_votes = Counter(str(run['answer']) for run in successful_runs)
+        voted_answer = answer_votes.most_common(1)[0][0]
+
+        for run in successful_runs:
+            if str(run['answer']) == voted_answer:
+                return run['program'], run['reasoning'], True, None
+
+        # Fallback should be unreachable, but keep a safe return path.
+        best_run = successful_runs[0]
+        return best_run['program'], best_run['reasoning'], True, None
     
     def _repair_program(self,
                        question: str,

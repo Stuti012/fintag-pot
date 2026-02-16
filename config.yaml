@@ -15,6 +15,12 @@ retrieval:
   chunk_size: 512
   chunk_overlap: 50
   enable_hybrid: true
+  reranker:
+    enabled: false
+    model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  semantic_cache:
+    enabled: false
+    similarity_threshold: 0.95
 
 temporal_decay:
   lambda: 0.1  # decay rate
@@ -42,6 +48,9 @@ indexing:
 program_execution:
   max_retry_attempts: 3
   timeout_seconds: 5
+  self_consistency:
+    enabled: false
+    num_samples: 5
   allowed_operations:
     - add
     - subtract
