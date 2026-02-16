@@ -4,6 +4,11 @@ from typing import List, Dict, Any, Optional
 from rank_bm25 import BM25Okapi
 import numpy as np
 from sentence_transformers import SentenceTransformer
+
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    CrossEncoder = None
 from indexing.schema import Document, RetrievalResult
 import yaml
 from pathlib import Path
@@ -21,10 +26,24 @@ class HybridRetriever:
         self.top_k = self.config['retrieval']['top_k']
         self.bm25_weight = self.config['retrieval']['bm25_weight']
         self.vector_weight = self.config['retrieval']['vector_weight']
+        self.rerank_enabled = self.config['retrieval'].get('enable_reranking', False)
+        self.rerank_weight = self.config['retrieval'].get('rerank_weight', 0.3)
+        self.rerank_model_name = self.config['retrieval'].get('reranker_model', "cross-encoder/ms-marco-MiniLM-L-6-v2")
         
         # Initialize embedding model
         print(f"Loading embedding model: {self.config['embedding']['model']}")
         self.embedding_model = SentenceTransformer(self.config['embedding']['model'])
+
+        self.cross_encoder = None
+        if self.rerank_enabled:
+            if CrossEncoder is None:
+                print("CrossEncoder unavailable; install sentence-transformers with cross-encoder support. Skipping reranking.")
+            else:
+                try:
+                    print(f"Loading reranker model: {self.rerank_model_name}")
+                    self.cross_encoder = CrossEncoder(self.rerank_model_name)
+                except Exception as e:
+                    print(f"Failed to load reranker model ({self.rerank_model_name}): {e}")
         
         # Initialize ChromaDB
         persist_dir = Path(self.config['indexing']['chroma_persist_dir'])
@@ -173,7 +192,8 @@ class HybridRetriever:
         
         # Convert to RetrievalResult objects
         results = []
-        for rank, doc_id in enumerate(sorted_doc_ids[:top_k]):
+        candidate_doc_ids = sorted_doc_ids[: max(top_k * 3, top_k)]
+        for rank, doc_id in enumerate(candidate_doc_ids):
             # Find document
             doc = self._find_document_by_id(doc_id)
             if doc:
@@ -184,8 +204,38 @@ class HybridRetriever:
                 )
                 results.append(result)
         
+        if self.cross_encoder is not None and results:
+            results = self._rerank_results(query, results, top_k)
+        else:
+            results = results[:top_k]
+            for rank, result in enumerate(results, start=1):
+                result.rank = rank
+
         return results
     
+    def _rerank_results(self, query: str, candidates: List[RetrievalResult], top_k: int) -> List[RetrievalResult]:
+        """Rerank candidates with a cross-encoder and blend scores."""
+        pairs = [[query, c.document.content] for c in candidates]
+        rerank_scores = self.cross_encoder.predict(pairs)
+
+        if len(rerank_scores) > 0:
+            min_score = float(np.min(rerank_scores))
+            max_score = float(np.max(rerank_scores))
+            denom = (max_score - min_score) if max_score != min_score else 1.0
+        else:
+            min_score = 0.0
+            denom = 1.0
+
+        for i, candidate in enumerate(candidates):
+            normalized_rerank = (float(rerank_scores[i]) - min_score) / denom
+            candidate.score = ((1 - self.rerank_weight) * candidate.score) + (self.rerank_weight * normalized_rerank)
+
+        candidates.sort(key=lambda x: x.score, reverse=True)
+        reranked = candidates[:top_k]
+        for rank, result in enumerate(reranked, start=1):
+            result.rank = rank
+        return reranked
+
     def _find_document_by_id(self, full_doc_id: str) -> Optional[Document]:
         """Find document by full ID"""
         for doc in self.bm25_docs:
