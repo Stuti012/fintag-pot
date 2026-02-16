@@ -72,9 +72,15 @@ class FinQARAGSystem:
         
         # Generate program
         print("Generating program...")
-        program_text, reasoning, success, error = self.program_generator.generate_with_repair(
-            question, retrieved, available_numbers
-        )
+        self_consistency_enabled = self.config.get('program_generation', {}).get('self_consistency', {}).get('enabled', False)
+        if self_consistency_enabled:
+            program_text, reasoning, success, error = self.program_generator.generate_with_self_consistency(
+                question, retrieved, available_numbers
+            )
+        else:
+            program_text, reasoning, success, error = self.program_generator.generate_with_repair(
+                question, retrieved, available_numbers
+            )
         
         if not success:
             return {

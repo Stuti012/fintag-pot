@@ -1,3 +1,4 @@
+from collections import Counter
 from typing import List, Tuple, Optional
 from indexing.schema import FinQAExample, RetrievalResult
 from llm.llm_client import LLMClient
@@ -18,11 +19,13 @@ class ProgramGenerator:
             timeout_seconds=self.config['program_execution']['timeout_seconds']
         )
         self.max_retry = self.config['program_execution']['max_retry_attempts']
+        self.self_consistency_config = self.config.get('program_generation', {}).get('self_consistency', {})
     
-    def generate_program(self, 
+    def generate_program(self,
                         question: str,
                         retrieved_evidence: List[RetrievalResult],
-                        available_numbers: Optional[List[float]] = None) -> Tuple[str, str, Optional[str]]:
+                        available_numbers: Optional[List[float]] = None,
+                        temperature: Optional[float] = None) -> Tuple[str, str, Optional[str]]:
         """Generate program for question with evidence
         
         Returns:
@@ -37,7 +40,7 @@ class ProgramGenerator:
         try:
             llm_output = self.llm_client.generate(
                 prompt=prompt,
-                temperature=0.0
+                temperature=0.0 if temperature is None else temperature
             )
             
             reasoning, program = self.executor.extract_reasoning_and_program(llm_output)
@@ -97,6 +100,57 @@ class ProgramGenerator:
             return program, reasoning, True, None
         
         return "", "", False, "Max retry attempts reached"
+
+    def generate_with_self_consistency(self,
+                                     question: str,
+                                     retrieved_evidence: List[RetrievalResult],
+                                     available_numbers: List[float],
+                                     n_samples: Optional[int] = None,
+                                     temperature: Optional[float] = None) -> Tuple[str, str, bool, Optional[str]]:
+        """Generate multiple candidate programs and choose by majority-vote answer."""
+        samples = n_samples or self.self_consistency_config.get('samples', 5)
+        if samples <= 1:
+            return self.generate_with_repair(question, retrieved_evidence, available_numbers)
+
+        generation_temperature = (
+            temperature
+            if temperature is not None
+            else self.self_consistency_config.get('temperature', 0.7)
+        )
+
+        successful_runs = []
+        errors = []
+
+        for _ in range(samples):
+            program, reasoning, gen_error = self.generate_program(
+                question=question,
+                retrieved_evidence=retrieved_evidence,
+                available_numbers=available_numbers,
+                temperature=generation_temperature
+            )
+
+            if gen_error:
+                errors.append(gen_error)
+                continue
+
+            final_answer, _, exec_error = self.executor.execute(program)
+            if exec_error:
+                errors.append(exec_error)
+                continue
+
+            successful_runs.append((program, reasoning, final_answer))
+
+        if not successful_runs:
+            return "", "", False, (errors[0] if errors else "Self-consistency generation failed")
+
+        vote = Counter(answer for _, _, answer in successful_runs)
+        best_answer, _ = vote.most_common(1)[0]
+
+        for program, reasoning, answer in successful_runs:
+            if answer == best_answer:
+                return program, reasoning, True, None
+
+        return "", "", False, "Self-consistency selection failed"
     
     def _repair_program(self,
                        question: str,
