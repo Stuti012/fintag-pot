@@ -1,0 +1,64 @@
+llm:
+  provider: anthropic  # anthropic or openai
+  model: claude-sonnet-4-20250514
+  temperature: 0.0
+  max_tokens: 4096
+
+embedding:
+  model: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 32
+
+retrieval:
+  top_k: 5
+  bm25_weight: 0.5
+  vector_weight: 0.5
+  chunk_size: 512
+  chunk_overlap: 50
+  enable_hybrid: true
+
+temporal_decay:
+  lambda: 0.1  # decay rate
+  enabled: true
+
+finqa:
+  data_path: ./data/finqa
+  split: validation  # train, validation, test
+  numerical_tolerance: 1e-3
+
+edgar:
+  data_path: ./data/edgar
+  user_agent: FinQA System contact@example.com
+  max_filings_per_ticker: 5
+  filing_types:
+    - 10-K
+    - 10-Q
+  
+indexing:
+  chroma_persist_dir: ./chroma_db
+  collection_name_finqa: finqa_collection
+  collection_name_edgar: edgar_collection
+  table_summary_enabled: true
+  
+program_execution:
+  max_retry_attempts: 3
+  timeout_seconds: 5
+  allowed_operations:
+    - add
+    - subtract
+    - multiply
+    - divide
+    - percent
+    - diff
+    - max
+    - min
+    - sum
+    - avg
+
+verification:
+  enable_numeric_verification: true
+  enable_xbrl_verification: false  # optional
+  tolerance: 0.01
+
+evaluation:
+  baseline_mode: false  # true for baseline, false for proposed
+  output_dir: ./evaluation_results
