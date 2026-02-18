@@ -72,9 +72,27 @@ class FinQARAGSystem:
         
         # Generate program
         print("Generating program...")
-        program_text, reasoning, success, error = self.program_generator.generate_with_repair(
-            question, retrieved, available_numbers
-        )
+        use_self_consistency = self.config['program_execution'].get('enable_self_consistency', False)
+
+        if use_self_consistency:
+            (
+                program_text,
+                reasoning,
+                success,
+                error,
+                voted_answer,
+                sample_runs,
+            ) = self.program_generator.generate_with_self_consistency(
+                question,
+                retrieved,
+                available_numbers,
+            )
+        else:
+            voted_answer = None
+            sample_runs = []
+            program_text, reasoning, success, error = self.program_generator.generate_with_repair(
+                question, retrieved, available_numbers
+            )
         
         if not success:
             return {
@@ -86,6 +104,9 @@ class FinQARAGSystem:
         # Execute program
         print("Executing program...")
         final_answer, program_obj, exec_error = self.program_executor.execute(program_text)
+
+        if voted_answer is not None:
+            final_answer = voted_answer
         
         if exec_error:
             return {
@@ -110,7 +131,11 @@ class FinQARAGSystem:
                     'type': r.document.doc_type
                 }
                 for r in retrieved
-            ]
+            ],
+            'self_consistency': {
+                'enabled': use_self_consistency,
+                'samples': sample_runs,
+            }
         }
         
         print(f"\nAnswer: {final_answer}")
