@@ -1,6 +1,6 @@
 import chromadb
 from chromadb.config import Settings
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from indexing.schema import Document, RetrievalResult
@@ -170,7 +170,17 @@ class HybridRetriever:
             retrieval_pool_size = top_k * self.rerank_candidates_multiplier
         
         # Vector search via ChromaDB
-        query_embedding = self.embedding_model.encode([query], convert_to_numpy=True)[0].tolist()
+        query_embedding_np = self.embedding_model.encode([query], convert_to_numpy=True)[0]
+
+        if self.semantic_cache is not None:
+            cached_results = self.semantic_cache.get(query, query_embedding_np)
+            if cached_results is not None:
+                return cached_results[:top_k]
+
+        query_embedding = query_embedding_np.tolist()
+
+        candidate_multiplier = self.reranking_config.get('candidate_multiplier', 2)
+        n_candidates = min(max(top_k * candidate_multiplier, top_k), len(self.bm25_docs))
         
         vector_results = self.collection.query(
             query_embeddings=[query_embedding],
@@ -209,8 +219,15 @@ class HybridRetriever:
                 else:
                     combined_scores[doc_id] = self.bm25_weight * normalized_score
         
-        # Sort by combined score
         sorted_doc_ids = sorted(combined_scores.keys(), key=lambda x: combined_scores[x], reverse=True)
+
+        if self.cross_encoder is not None and sorted_doc_ids:
+            sorted_doc_ids = self._rerank_with_cross_encoder(
+                query=query,
+                sorted_doc_ids=sorted_doc_ids,
+                combined_scores=combined_scores,
+                top_k=top_k
+            )
         
         # Convert to RetrievalResult objects
         results = []

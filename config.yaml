@@ -15,6 +15,21 @@ retrieval:
   chunk_size: 512
   chunk_overlap: 50
   enable_hybrid: true
+  reranking:
+    enabled: false
+    model: cross-encoder/ms-marco-MiniLM-L-6-v2
+    candidate_multiplier: 3
+    blend_weight: 0.3
+  semantic_cache:
+    enabled: true
+    threshold: 0.95
+    max_entries: 1000
+
+program_generation:
+  self_consistency:
+    enabled: true
+    samples: 5
+    temperature: 0.7
   enable_reranking: true
   rerank_model: cross-encoder/ms-marco-MiniLM-L-6-v2
   rerank_weight: 0.3

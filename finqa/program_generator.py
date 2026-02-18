@@ -19,10 +19,11 @@ class ProgramGenerator:
             timeout_seconds=self.config['program_execution']['timeout_seconds']
         )
         self.max_retry = self.config['program_execution']['max_retry_attempts']
+        self.self_consistency_config = self.config.get('program_generation', {}).get('self_consistency', {})
         self.self_consistency_samples = self.config['program_execution'].get('self_consistency_samples', 5)
         self.self_consistency_temperature = self.config['program_execution'].get('self_consistency_temperature', 0.7)
     
-    def generate_program(self, 
+    def generate_program(self,
                         question: str,
                         retrieved_evidence: List[RetrievalResult],
                         available_numbers: Optional[List[float]] = None,
