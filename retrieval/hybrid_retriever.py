@@ -17,12 +17,12 @@ except ImportError:
 
 
 class HybridRetriever:
-    """Hybrid retrieval using BM25 + Vector search"""
-    
+    """Hybrid retrieval using BM25 + Vector search with optional reranking/cache."""
+
     def __init__(self, collection_name: str, config_path: str = "config.yaml"):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
+
         self.collection_name = collection_name
         self.top_k = self.config['retrieval']['top_k']
         self.bm25_weight = self.config['retrieval']['bm25_weight']
@@ -61,102 +61,84 @@ class HybridRetriever:
         # Initialize ChromaDB
         persist_dir = Path(self.config['indexing']['chroma_persist_dir'])
         persist_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.chroma_client = chromadb.PersistentClient(
             path=str(persist_dir),
             settings=Settings(anonymized_telemetry=False)
         )
-        
+
         # Get or create collection
         try:
             self.collection = self.chroma_client.get_collection(name=collection_name)
             print(f"Loaded existing collection: {collection_name}")
-        except:
+        except Exception:
             self.collection = self.chroma_client.create_collection(
                 name=collection_name,
                 metadata={"hnsw:space": "cosine"}
             )
             print(f"Created new collection: {collection_name}")
-        
+
         # BM25 index
         self.bm25_index = None
         self.bm25_docs = []
         self.bm25_index_path = persist_dir / f"{collection_name}_bm25.pkl"
-        
+
         # Load BM25 index if exists
         self._load_bm25_index()
-    
+
     def index_documents(self, documents: List[Document]):
         """Index documents for hybrid retrieval"""
         if not documents:
             return
-        
+
         print(f"Indexing {len(documents)} documents...")
-        
+
         # Prepare data for ChromaDB
         ids = []
         contents = []
         embeddings = []
         metadatas = []
-        
-        # Prepare data for BM25
-        bm25_docs = []
-        
+
         for doc in documents:
             doc_full_id = f"{doc.doc_id}_{doc.chunk_id}"
             ids.append(doc_full_id)
             contents.append(doc.content)
-            
-            # Metadata for ChromaDB
+
             metadata = {
                 'doc_id': doc.doc_id,
                 'chunk_id': doc.chunk_id,
                 'doc_type': doc.doc_type.value if hasattr(doc.doc_type, 'value') else str(doc.doc_type),
                 'source_type': doc.source_type.value if hasattr(doc.source_type, 'value') else str(doc.source_type),
             }
-            # Add custom metadata
             for key, value in doc.metadata.items():
-                # ChromaDB requires simple types
                 if isinstance(value, (str, int, float, bool)):
                     metadata[key] = value
                 else:
                     metadata[key] = str(value)
-            
+
             metadatas.append(metadata)
-            
-            # BM25 tokenization
-            bm25_docs.append(doc.content.lower().split())
-        
+
         # Generate embeddings in batches
         batch_size = self.config['embedding']['batch_size']
         for i in range(0, len(contents), batch_size):
-            batch = contents[i:i+batch_size]
+            batch = contents[i:i + batch_size]
             batch_embeddings = self.embedding_model.encode(
                 batch,
                 show_progress_bar=False,
                 convert_to_numpy=True
             )
             embeddings.extend(batch_embeddings.tolist())
-        
-        # Add to ChromaDB
-        self.collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=contents,
-            metadatas=metadatas
-        )
-        
-        # Build BM25 index
+
+        self.collection.add(ids=ids, embeddings=embeddings, documents=contents, metadatas=metadatas)
+
         self.bm25_docs.extend(documents)
         self.bm25_index = BM25Okapi([doc.content.lower().split() for doc in self.bm25_docs])
-        
-        # Save BM25 index
         self._save_bm25_index()
-        
+
         print(f"Indexed {len(documents)} documents successfully")
-    
+
     def retrieve(self, query: str, top_k: Optional[int] = None) -> List[RetrievalResult]:
-        """Hybrid retrieval using BM25 + Vector search"""
+        """Hybrid retrieval using BM25 + Vector search with optional reranking and cache."""
         if top_k is None:
             top_k = self.top_k
 
@@ -186,32 +168,24 @@ class HybridRetriever:
             query_embeddings=[query_embedding],
             n_results=min(retrieval_pool_size * 2, len(self.bm25_docs))  # Get more for fusion
         )
-        
-        # BM25 search
+
         bm25_scores = {}
         if self.bm25_index is not None:
             tokenized_query = query.lower().split()
             scores = self.bm25_index.get_scores(tokenized_query)
-            
             for i, score in enumerate(scores):
                 doc = self.bm25_docs[i]
                 doc_id = f"{doc.doc_id}_{doc.chunk_id}"
                 bm25_scores[doc_id] = score
-        
-        # Combine scores
+
         combined_scores = {}
-        
-        # Process vector results
         for i, doc_id in enumerate(vector_results['ids'][0]):
             distance = vector_results['distances'][0][i]
-            # Convert distance to similarity score (lower distance = higher similarity)
             vector_score = 1 / (1 + distance)
             combined_scores[doc_id] = self.vector_weight * vector_score
-        
-        # Add BM25 scores
-        # Normalize BM25 scores
+
         if bm25_scores:
-            max_bm25 = max(bm25_scores.values()) if bm25_scores else 1
+            max_bm25 = max(bm25_scores.values())
             for doc_id, score in bm25_scores.items():
                 normalized_score = score / max_bm25 if max_bm25 > 0 else 0
                 if doc_id in combined_scores:
@@ -235,10 +209,8 @@ class HybridRetriever:
             # Find document
             doc = self._find_document_by_id(doc_id)
             if doc:
-                result = RetrievalResult(
-                    document=doc,
-                    score=combined_scores[doc_id],
-                    rank=rank + 1
+                candidates.append(
+                    RetrievalResult(document=doc, score=combined_scores[doc_id], rank=rank + 1)
                 )
                 results.append(result)
 
@@ -265,23 +237,17 @@ class HybridRetriever:
         return final_results
     
     def _find_document_by_id(self, full_doc_id: str) -> Optional[Document]:
-        """Find document by full ID"""
         for doc in self.bm25_docs:
             if f"{doc.doc_id}_{doc.chunk_id}" == full_doc_id:
                 return doc
         return None
-    
+
     def _save_bm25_index(self):
-        """Save BM25 index to disk"""
-        data = {
-            'index': self.bm25_index,
-            'docs': self.bm25_docs
-        }
+        data = {'index': self.bm25_index, 'docs': self.bm25_docs}
         with open(self.bm25_index_path, 'wb') as f:
             pickle.dump(data, f)
-    
+
     def _load_bm25_index(self):
-        """Load BM25 index from disk"""
         if self.bm25_index_path.exists():
             try:
                 with open(self.bm25_index_path, 'rb') as f:
@@ -291,22 +257,19 @@ class HybridRetriever:
                 print(f"Loaded BM25 index with {len(self.bm25_docs)} documents")
             except Exception as e:
                 print(f"Failed to load BM25 index: {e}")
-    
+
     def clear_collection(self):
-        """Clear the collection"""
         try:
             self.chroma_client.delete_collection(name=self.collection_name)
             print(f"Deleted collection: {self.collection_name}")
-        except:
+        except Exception:
             pass
-        
-        # Recreate
+
         self.collection = self.chroma_client.create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"}
         )
-        
-        # Clear BM25
+
         self.bm25_index = None
         self.bm25_docs = []
         if self.bm25_index_path.exists():
@@ -314,13 +277,11 @@ class HybridRetriever:
 
 
 if __name__ == "__main__":
-    from indexing.schema import Document, DocumentType, SourceType
-    
-    # Test
+    from indexing.schema import DocumentType, SourceType
+
     retriever = HybridRetriever("test_collection")
     retriever.clear_collection()
-    
-    # Create test documents
+
     docs = [
         Document(
             doc_id="doc1",
@@ -339,11 +300,11 @@ if __name__ == "__main__":
             metadata={}
         ),
     ]
-    
+
     retriever.index_documents(docs)
-    
+
     results = retriever.retrieve("What was Apple's revenue?", top_k=2)
-    
+
     print(f"Found {len(results)} results:")
     for r in results:
         print(f"Score: {r.score:.3f}, Content: {r.document.content}")
