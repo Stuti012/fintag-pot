@@ -19,10 +19,11 @@ class ProgramGenerator:
             timeout_seconds=self.config['program_execution']['timeout_seconds']
         )
         self.max_retry = self.config['program_execution']['max_retry_attempts']
+        self.self_consistency_config = self.config.get('program_generation', {}).get('self_consistency', {})
         self.self_consistency_samples = self.config['program_execution'].get('self_consistency_samples', 5)
         self.self_consistency_temperature = self.config['program_execution'].get('self_consistency_temperature', 0.7)
     
-    def generate_program(self, 
+    def generate_program(self,
                         question: str,
                         retrieved_evidence: List[RetrievalResult],
                         available_numbers: Optional[List[float]] = None,
@@ -186,6 +187,56 @@ class ProgramGenerator:
             runs,
         )
     
+    def generate_with_self_consistency(self,
+                                       question: str,
+                                       retrieved_evidence: List[RetrievalResult],
+                                       available_numbers: List[float],
+                                       n_samples: Optional[int] = None) -> Tuple[str, str, bool, Optional[str], Optional[float]]:
+        """Generate multiple programs and return majority-vote result."""
+        sample_count = n_samples or self.self_consistency_samples
+
+        successful_runs: List[Tuple[str, str, float]] = []
+        errors: List[str] = []
+
+        for _ in range(sample_count):
+            program, reasoning, error = self.generate_program(
+                question,
+                retrieved_evidence,
+                available_numbers=available_numbers,
+                temperature=0.7,
+            )
+
+            if error:
+                errors.append(error)
+                continue
+
+            result, _, exec_error = self.executor.execute(program)
+            if exec_error or result is None:
+                errors.append(exec_error or "Empty execution result")
+                continue
+
+            try:
+                numeric_result = float(result)
+            except (TypeError, ValueError):
+                errors.append(f"Non-numeric result: {result}")
+                continue
+
+            successful_runs.append((program, reasoning, numeric_result))
+
+        if not successful_runs:
+            message = errors[-1] if errors else "Self-consistency failed to produce any valid program"
+            return "", "", False, message, None
+
+        result_counter = Counter(round(run[2], 6) for run in successful_runs)
+        majority_value, _ = result_counter.most_common(1)[0]
+
+        for program, reasoning, value in successful_runs:
+            if round(value, 6) == majority_value:
+                return program, reasoning, True, None, value
+
+        fallback_program, fallback_reasoning, fallback_value = successful_runs[0]
+        return fallback_program, fallback_reasoning, True, None, fallback_value
+
     def _repair_program(self,
                        question: str,
                        evidence: str,
