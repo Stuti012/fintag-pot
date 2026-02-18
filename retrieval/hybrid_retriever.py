@@ -10,6 +10,11 @@ import pickle
 
 from retrieval.semantic_cache import SemanticCache
 
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    CrossEncoder = None
+
 
 class HybridRetriever:
     """Hybrid retrieval using BM25 + Vector search"""
@@ -22,32 +27,35 @@ class HybridRetriever:
         self.top_k = self.config['retrieval']['top_k']
         self.bm25_weight = self.config['retrieval']['bm25_weight']
         self.vector_weight = self.config['retrieval']['vector_weight']
-        self.reranking_config = self.config['retrieval'].get('reranking', {})
-        self.cache_config = self.config['retrieval'].get('semantic_cache', {})
+        self.enable_reranking = self.config['retrieval'].get('enable_reranking', False)
+        self.rerank_weight = self.config['retrieval'].get('rerank_weight', 0.3)
+        self.rerank_candidates_multiplier = self.config['retrieval'].get('rerank_candidates_multiplier', 3)
+        self.enable_semantic_cache = self.config['retrieval'].get('enable_semantic_cache', False)
         
         # Initialize embedding model
         print(f"Loading embedding model: {self.config['embedding']['model']}")
         self.embedding_model = SentenceTransformer(self.config['embedding']['model'])
 
         self.cross_encoder = None
-        if self.reranking_config.get('enabled', False):
-            try:
-                from sentence_transformers import CrossEncoder
-
-                model_name = self.reranking_config.get(
-                    'model',
-                    'cross-encoder/ms-marco-MiniLM-L-6-v2'
-                )
-                print(f"Loading cross-encoder reranker: {model_name}")
-                self.cross_encoder = CrossEncoder(model_name)
-            except Exception as e:
-                print(f"Cross-encoder disabled (load failed): {e}")
+        if self.enable_reranking:
+            rerank_model_name = self.config['retrieval'].get(
+                'rerank_model',
+                'cross-encoder/ms-marco-MiniLM-L-6-v2'
+            )
+            if CrossEncoder is None:
+                print("Warning: CrossEncoder unavailable, reranking disabled")
+                self.enable_reranking = False
+            else:
+                print(f"Loading reranker model: {rerank_model_name}")
+                self.cross_encoder = CrossEncoder(rerank_model_name)
 
         self.semantic_cache = None
-        if self.cache_config.get('enabled', False):
+        if self.enable_semantic_cache:
+            cache_threshold = self.config['retrieval'].get('semantic_cache_threshold', 0.95)
+            print(f"Initializing semantic cache (threshold={cache_threshold})")
             self.semantic_cache = SemanticCache(
-                threshold=self.cache_config.get('threshold', 0.95),
-                max_entries=self.cache_config.get('max_entries', 1000)
+                model_name=self.config['embedding']['model'],
+                similarity_threshold=cache_threshold,
             )
         
         # Initialize ChromaDB
@@ -152,9 +160,15 @@ class HybridRetriever:
         if top_k is None:
             top_k = self.top_k
 
-        if not self.bm25_docs:
-            return []
+        if self.semantic_cache is not None:
+            cached_results = self.semantic_cache.get(query)
+            if cached_results is not None:
+                return cached_results[:top_k]
 
+        retrieval_pool_size = top_k
+        if self.enable_reranking:
+            retrieval_pool_size = top_k * self.rerank_candidates_multiplier
+        
         # Vector search via ChromaDB
         query_embedding_np = self.embedding_model.encode([query], convert_to_numpy=True)[0]
 
@@ -170,7 +184,7 @@ class HybridRetriever:
         
         vector_results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=n_candidates
+            n_results=min(retrieval_pool_size * 2, len(self.bm25_docs))  # Get more for fusion
         )
         
         # BM25 search
@@ -217,7 +231,7 @@ class HybridRetriever:
         
         # Convert to RetrievalResult objects
         results = []
-        for rank, doc_id in enumerate(sorted_doc_ids[:top_k]):
+        for rank, doc_id in enumerate(sorted_doc_ids[:retrieval_pool_size]):
             # Find document
             doc = self._find_document_by_id(doc_id)
             if doc:
@@ -228,53 +242,27 @@ class HybridRetriever:
                 )
                 results.append(result)
 
-        if self.semantic_cache is not None and results:
-            self.semantic_cache.put(query, query_embedding_np, results)
+        if self.enable_reranking and self.cross_encoder and len(results) > top_k:
+            pairs = [[query, r.document.content] for r in results]
+            rerank_scores = self.cross_encoder.predict(pairs)
 
-        return results
+            for i, rerank_score in enumerate(rerank_scores):
+                results[i].score = (
+                    (1.0 - self.rerank_weight) * results[i].score
+                    + self.rerank_weight * float(rerank_score)
+                )
 
-    def _rerank_with_cross_encoder(
-        self,
-        query: str,
-        sorted_doc_ids: List[str],
-        combined_scores: Dict[str, float],
-        top_k: int
-    ) -> List[str]:
-        """Re-rank retrieval candidates using a cross-encoder."""
-        if self.cross_encoder is None:
-            return sorted_doc_ids
+            results.sort(key=lambda x: x.score, reverse=True)
 
-        # Re-rank a slightly larger subset than top_k
-        rerank_count = min(len(sorted_doc_ids), max(top_k * 3, top_k))
-        candidate_ids = sorted_doc_ids[:rerank_count]
-        candidate_docs = [self._find_document_by_id(doc_id) for doc_id in candidate_ids]
-        valid_candidates = [
-            (doc_id, doc)
-            for doc_id, doc in zip(candidate_ids, candidate_docs)
-            if doc is not None
-        ]
-        if not valid_candidates:
-            return sorted_doc_ids
+        final_results = []
+        for idx, result in enumerate(results[:top_k], start=1):
+            result.rank = idx
+            final_results.append(result)
 
-        pairs = [[query, doc.content] for _, doc in valid_candidates]
-        rerank_scores = self.cross_encoder.predict(pairs)
-        blend_weight = self.reranking_config.get('blend_weight', 0.3)
+        if self.semantic_cache is not None:
+            self.semantic_cache.put(query, final_results)
 
-        blended = []
-        for (doc_id, _), rerank_score in zip(valid_candidates, rerank_scores):
-            original_score = combined_scores.get(doc_id, 0.0)
-            blended_score = (1 - blend_weight) * original_score + blend_weight * float(rerank_score)
-            blended.append((doc_id, blended_score))
-
-        blended.sort(key=lambda x: x[1], reverse=True)
-        reranked_ids = [doc_id for doc_id, _ in blended]
-        for doc_id, blended_score in blended:
-            combined_scores[doc_id] = blended_score
-
-        # Keep untouched tail order
-        reranked_set = set(reranked_ids)
-        tail_ids = [doc_id for doc_id in sorted_doc_ids if doc_id not in reranked_set]
-        return reranked_ids + tail_ids
+        return final_results
     
     def _find_document_by_id(self, full_doc_id: str) -> Optional[Document]:
         """Find document by full ID"""

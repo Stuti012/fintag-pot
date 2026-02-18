@@ -1,60 +1,59 @@
-from collections import OrderedDict
-from typing import Any, Optional
+import math
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
-import numpy as np
+from sentence_transformers import SentenceTransformer
+
+
+@dataclass
+class SemanticCacheEntry:
+    query: str
+    embedding: List[float]
+    value: Any
 
 
 class SemanticCache:
-    """In-memory semantic cache using cosine similarity over embeddings."""
+    """In-memory semantic cache for query/result reuse."""
 
-    def __init__(self, threshold: float = 0.95, max_entries: int = 1000):
-        self.threshold = threshold
-        self.max_entries = max_entries
-        self._store: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+    def __init__(self, model_name: str, similarity_threshold: float = 0.95):
+        self.model = SentenceTransformer(model_name)
+        self.similarity_threshold = similarity_threshold
+        self.entries: List[SemanticCacheEntry] = []
 
-    def get(self, query: str, query_embedding: np.ndarray) -> Optional[Any]:
-        """Return cached value for closest query if above similarity threshold."""
-        if not self._store:
+    def _l2_norm(self, values: List[float]) -> float:
+        return math.sqrt(sum(value * value for value in values))
+
+    def _encode(self, text: str) -> List[float]:
+        embedding = self.model.encode([text], convert_to_numpy=False)[0]
+        embedding_list = [float(v) for v in embedding]
+        norm = self._l2_norm(embedding_list)
+        if norm == 0:
+            return embedding_list
+        return [value / norm for value in embedding_list]
+
+    def _cosine_similarity(self, lhs: List[float], rhs: List[float]) -> float:
+        return sum(l * r for l, r in zip(lhs, rhs))
+
+    def get(self, query: str, threshold: Optional[float] = None) -> Optional[Any]:
+        if not self.entries:
             return None
 
-        if not isinstance(query_embedding, np.ndarray):
-            query_embedding = np.array(query_embedding, dtype=np.float32)
+        query_embedding = self._encode(query)
+        similarities = [self._cosine_similarity(query_embedding, entry.embedding) for entry in self.entries]
 
-        query_norm = np.linalg.norm(query_embedding)
-        if query_norm == 0:
-            return None
+        best_index = max(range(len(similarities)), key=lambda idx: similarities[idx])
+        best_similarity = similarities[best_index]
+        active_threshold = threshold if threshold is not None else self.similarity_threshold
 
-        best_key = None
-        best_similarity = -1.0
-
-        for key, payload in self._store.items():
-            cached_embedding = payload["embedding"]
-            denominator = query_norm * np.linalg.norm(cached_embedding)
-            if denominator == 0:
-                continue
-
-            similarity = float(np.dot(query_embedding, cached_embedding) / denominator)
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_key = key
-
-        if best_key is not None and best_similarity >= self.threshold:
-            # mark as recently used
-            self._store.move_to_end(best_key)
-            return self._store[best_key]["value"]
-
+        if best_similarity >= active_threshold:
+            return self.entries[best_index].value
         return None
 
-    def put(self, query: str, query_embedding: np.ndarray, value: Any):
-        """Insert query/value pair and evict oldest entries if needed."""
-        if not isinstance(query_embedding, np.ndarray):
-            query_embedding = np.array(query_embedding, dtype=np.float32)
-
-        self._store[query] = {
-            "embedding": query_embedding,
-            "value": value,
-        }
-        self._store.move_to_end(query)
-
-        while len(self._store) > self.max_entries:
-            self._store.popitem(last=False)
+    def put(self, query: str, value: Any):
+        self.entries.append(
+            SemanticCacheEntry(
+                query=query,
+                embedding=self._encode(query),
+                value=value,
+            )
+        )
