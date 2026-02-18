@@ -1,5 +1,5 @@
 from collections import Counter
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from indexing.schema import FinQAExample, RetrievalResult
 from llm.llm_client import LLMClient
 from llm.prompts import get_program_generation_prompt, get_program_repair_prompt
@@ -19,11 +19,15 @@ class ProgramGenerator:
             timeout_seconds=self.config['program_execution']['timeout_seconds']
         )
         self.max_retry = self.config['program_execution']['max_retry_attempts']
+        self.self_consistency_config = self.config.get('program_generation', {}).get('self_consistency', {})
+        self.self_consistency_samples = self.config['program_execution'].get('self_consistency_samples', 5)
+        self.self_consistency_temperature = self.config['program_execution'].get('self_consistency_temperature', 0.7)
     
-    def generate_program(self, 
+    def generate_program(self,
                         question: str,
                         retrieved_evidence: List[RetrievalResult],
-                        available_numbers: Optional[List[float]] = None) -> Tuple[str, str, Optional[str]]:
+                        available_numbers: Optional[List[float]] = None,
+                        temperature: float = 0.0) -> Tuple[str, str, Optional[str]]:
         """Generate program for question with evidence
         
         Returns:
@@ -38,7 +42,7 @@ class ProgramGenerator:
         try:
             llm_output = self.llm_client.generate(
                 prompt=prompt,
-                temperature=0.0
+                temperature=temperature
             )
             
             reasoning, program = self.executor.extract_reasoning_and_program(llm_output)
@@ -104,51 +108,84 @@ class ProgramGenerator:
         question: str,
         retrieved_evidence: List[RetrievalResult],
         available_numbers: List[float],
-        n_samples: int = 5,
-    ) -> Tuple[str, str, bool, Optional[str]]:
-        """Generate multiple candidate programs and pick answer by majority vote."""
-        successful_runs = []
-        errors = []
+        n: Optional[int] = None,
+    ) -> Tuple[str, str, bool, Optional[str], Optional[str], List[Dict[str, Any]]]:
+        """Generate multiple programs and select by majority-vote answer.
 
-        for _ in range(max(1, n_samples)):
-            program, reasoning, success, error = self.generate_with_repair(
-                question=question,
-                retrieved_evidence=retrieved_evidence,
-                available_numbers=available_numbers,
-            )
+        Returns:
+            (best_program, best_reasoning, success, error, voted_answer, sampled_runs)
+        """
+        num_samples = n or self.self_consistency_samples
+        runs: List[Dict[str, Any]] = []
 
-            if not success:
-                if error:
-                    errors.append(error)
-                continue
+        for _ in range(num_samples):
+            try:
+                program, reasoning, gen_error = self.generate_program(
+                    question=question,
+                    retrieved_evidence=retrieved_evidence,
+                    available_numbers=available_numbers,
+                    temperature=self.self_consistency_temperature,
+                )
+                if gen_error:
+                    runs.append(
+                        {
+                            'program': program,
+                            'reasoning': reasoning,
+                            'answer': None,
+                            'success': False,
+                            'error': gen_error,
+                        }
+                    )
+                    continue
 
-            final_answer, _, exec_error = self.executor.execute(program)
-            if exec_error:
-                errors.append(exec_error)
-                continue
+                final_answer, _, exec_error = self.executor.execute(program)
+                if exec_error:
+                    runs.append(
+                        {
+                            'program': program,
+                            'reasoning': reasoning,
+                            'answer': None,
+                            'success': False,
+                            'error': exec_error,
+                        }
+                    )
+                    continue
 
-            successful_runs.append(
-                {
-                    'program': program,
-                    'reasoning': reasoning,
-                    'answer': final_answer,
-                }
-            )
+                runs.append(
+                    {
+                        'program': program,
+                        'reasoning': reasoning,
+                        'answer': str(final_answer),
+                        'success': True,
+                        'error': None,
+                    }
+                )
+            except Exception as exc:
+                runs.append(
+                    {
+                        'program': '',
+                        'reasoning': '',
+                        'answer': None,
+                        'success': False,
+                        'error': str(exc),
+                    }
+                )
 
+        successful_runs = [run for run in runs if run['success'] and run['answer'] is not None]
         if not successful_runs:
-            error_message = errors[0] if errors else "Self-consistency generation failed"
-            return "", "", False, error_message
+            return '', '', False, 'All self-consistency samples failed', None, runs
 
-        answer_votes = Counter(str(run['answer']) for run in successful_runs)
-        voted_answer = answer_votes.most_common(1)[0][0]
+        voted_answer = Counter(run['answer'] for run in successful_runs).most_common(1)[0][0]
 
-        for run in successful_runs:
-            if str(run['answer']) == voted_answer:
-                return run['program'], run['reasoning'], True, None
-
-        # Fallback should be unreachable, but keep a safe return path.
-        best_run = successful_runs[0]
-        return best_run['program'], best_run['reasoning'], True, None
+        selected_run = next(run for run in successful_runs if run['answer'] == voted_answer)
+        return (
+            selected_run['program'],
+            selected_run['reasoning'],
+            True,
+            None,
+            voted_answer,
+            runs,
+        )
     
     def _repair_program(self,
                        question: str,
