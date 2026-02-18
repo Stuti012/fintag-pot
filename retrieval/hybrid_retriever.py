@@ -3,6 +3,11 @@ from chromadb.config import Settings
 from typing import List, Dict, Optional
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    CrossEncoder = None
 from indexing.schema import Document, RetrievalResult
 import yaml
 from pathlib import Path
@@ -236,6 +241,29 @@ class HybridRetriever:
 
         return final_results
     
+    def _rerank_results(self, query: str, candidates: List[RetrievalResult], top_k: int) -> List[RetrievalResult]:
+        """Rerank candidates with a cross-encoder and blend scores."""
+        pairs = [[query, c.document.content] for c in candidates]
+        rerank_scores = self.cross_encoder.predict(pairs)
+
+        if len(rerank_scores) > 0:
+            min_score = float(np.min(rerank_scores))
+            max_score = float(np.max(rerank_scores))
+            denom = (max_score - min_score) if max_score != min_score else 1.0
+        else:
+            min_score = 0.0
+            denom = 1.0
+
+        for i, candidate in enumerate(candidates):
+            normalized_rerank = (float(rerank_scores[i]) - min_score) / denom
+            candidate.score = ((1 - self.rerank_weight) * candidate.score) + (self.rerank_weight * normalized_rerank)
+
+        candidates.sort(key=lambda x: x.score, reverse=True)
+        reranked = candidates[:top_k]
+        for rank, result in enumerate(reranked, start=1):
+            result.rank = rank
+        return reranked
+
     def _find_document_by_id(self, full_doc_id: str) -> Optional[Document]:
         for doc in self.bm25_docs:
             if f"{doc.doc_id}_{doc.chunk_id}" == full_doc_id:

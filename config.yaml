@@ -86,3 +86,7 @@ verification:
 evaluation:
   baseline_mode: false  # true for baseline, false for proposed
   output_dir: ./evaluation_results
+
+semantic_cache:
+  similarity_threshold: 0.95
+  max_size: 500
