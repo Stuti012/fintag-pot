@@ -11,6 +11,7 @@ from finqa.finqa_eval import FinQAEvaluator
 from edgar.edgar_download import EDGARDownloader
 from indexing.build_index import IndexBuilder
 from retrieval.temporal_decay import TemporalDecayRetriever
+from retrieval.semantic_cache import SemanticCache
 
 from llm.llm_client import LLMClient
 from llm.prompts import get_edgar_answer_with_tables_prompt
@@ -45,6 +46,22 @@ class FinQARAGSystem:
             collection_name=self.config['indexing']['collection_name_edgar'],
             config_path=config_path
         )
+
+        cache_cfg = self.config.get('semantic_cache', {})
+        cache_threshold = cache_cfg.get('similarity_threshold', 0.95)
+        cache_size = cache_cfg.get('max_size', 500)
+        embedding_model = self.config['embedding']['model']
+
+        self.finqa_cache = SemanticCache(
+            model_name=embedding_model,
+            similarity_threshold=cache_threshold,
+            max_size=cache_size,
+        )
+        self.edgar_cache = SemanticCache(
+            model_name=embedding_model,
+            similarity_threshold=cache_threshold,
+            max_size=cache_size,
+        )
     
     def query_finqa(self, question: str, question_id: str) -> dict:
         """Query FinQA system with Program-of-Thought
@@ -57,6 +74,12 @@ class FinQARAGSystem:
             Answer with program and evidence
         """
         print(f"\nQuestion: {question}")
+        cache_key = f"{question_id}::{question}"
+        cached_result = self.finqa_cache.get(cache_key)
+        if cached_result:
+            print("Semantic cache hit (FinQA)")
+            return cached_result
+
         print("Retrieving evidence...")
         
         # Retrieve evidence
@@ -70,11 +93,29 @@ class FinQARAGSystem:
         available_numbers = self.program_generator.extract_numbers_from_evidence(retrieved)
         print(f"Found {len(available_numbers)} numbers in evidence")
         
-        # Generate program
+        # Generate program with optional self-consistency
         print("Generating program...")
-        program_text, reasoning, success, error = self.program_generator.generate_with_repair(
-            question, retrieved, available_numbers
-        )
+        use_self_consistency = self.config['program_execution'].get('enable_self_consistency', False)
+
+        if use_self_consistency:
+            (
+                program_text,
+                reasoning,
+                success,
+                error,
+                voted_answer,
+                sample_runs,
+            ) = self.program_generator.generate_with_self_consistency(
+                question,
+                retrieved,
+                available_numbers,
+            )
+        else:
+            voted_answer = None
+            sample_runs = []
+            program_text, reasoning, success, error = self.program_generator.generate_with_repair(
+                question, retrieved, available_numbers
+            )
         
         if not success:
             return {
@@ -86,6 +127,9 @@ class FinQARAGSystem:
         # Execute program
         print("Executing program...")
         final_answer, program_obj, exec_error = self.program_executor.execute(program_text)
+
+        if voted_answer is not None:
+            final_answer = voted_answer
         
         if exec_error:
             return {
@@ -110,12 +154,17 @@ class FinQARAGSystem:
                     'type': r.document.doc_type
                 }
                 for r in retrieved
-            ]
+            ],
+            'self_consistency': {
+                'enabled': use_self_consistency,
+                'samples': sample_runs,
+            }
         }
         
         print(f"\nAnswer: {final_answer}")
         print(f"Program:\n{program_text}")
-        
+
+        self.finqa_cache.put(cache_key, result)
         return result
     
     def query_edgar(self, query: str, ticker: str = None) -> dict:
@@ -131,7 +180,13 @@ class FinQARAGSystem:
         print(f"\nQuery: {query}")
         if ticker:
             print(f"Ticker: {ticker}")
-        
+
+        cache_key = f"{ticker or 'ALL'}::{query}"
+        cached_result = self.edgar_cache.get(cache_key)
+        if cached_result:
+            print("Semantic cache hit (EDGAR)")
+            return cached_result
+
         print("Retrieving from EDGAR filings...")
         
         # Retrieve with temporal decay
@@ -213,6 +268,7 @@ class FinQARAGSystem:
         if not verification['verified']:
             print(f"\nWarning: {verification['message']}")
         
+        self.edgar_cache.put(cache_key, result)
         return result
 
 
