@@ -1,6 +1,13 @@
-from typing import List, Optional
+import chromadb
+from chromadb.config import Settings
+from typing import List, Dict, Optional
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    CrossEncoder = None
 from indexing.schema import Document, RetrievalResult
 import yaml
 from pathlib import Path
@@ -9,20 +16,13 @@ import pickle
 from retrieval.semantic_cache import SemanticCache
 
 try:
-    import chromadb
-    from chromadb.config import Settings
-except ImportError:
-    chromadb = None
-    Settings = None
-
-try:
     from sentence_transformers import CrossEncoder
 except ImportError:
     CrossEncoder = None
 
 
 class HybridRetriever:
-    """Hybrid retrieval using BM25 + Vector search (with BM25 fallback)."""
+    """Hybrid retrieval using BM25 + Vector search with optional reranking/cache."""
 
     def __init__(self, collection_name: str, config_path: str = "config.yaml"):
         with open(config_path, 'r') as f:
@@ -36,7 +36,8 @@ class HybridRetriever:
         self.rerank_weight = self.config['retrieval'].get('rerank_weight', 0.3)
         self.rerank_candidates_multiplier = self.config['retrieval'].get('rerank_candidates_multiplier', 3)
         self.enable_semantic_cache = self.config['retrieval'].get('enable_semantic_cache', False)
-
+        
+        # Initialize embedding model
         print(f"Loading embedding model: {self.config['embedding']['model']}")
         self.embedding_model = SentenceTransformer(self.config['embedding']['model'])
 
@@ -61,36 +62,33 @@ class HybridRetriever:
                 model_name=self.config['embedding']['model'],
                 similarity_threshold=cache_threshold,
             )
-
+        
+        # Initialize ChromaDB
         persist_dir = Path(self.config['indexing']['chroma_persist_dir'])
         persist_dir.mkdir(parents=True, exist_ok=True)
 
-        self.chroma_available = chromadb is not None
-        self.chroma_client = None
-        self.collection = None
-        if self.chroma_available:
-            self.chroma_client = chromadb.PersistentClient(
-                path=str(persist_dir),
-                settings=Settings(anonymized_telemetry=False)
+        self.chroma_client = chromadb.PersistentClient(
+            path=str(persist_dir),
+            settings=Settings(anonymized_telemetry=False)
+        )
+
+        # Get or create collection
+        try:
+            self.collection = self.chroma_client.get_collection(name=collection_name)
+            print(f"Loaded existing collection: {collection_name}")
+        except Exception:
+            self.collection = self.chroma_client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
             )
+            print(f"Created new collection: {collection_name}")
 
-            try:
-                self.collection = self.chroma_client.get_collection(name=collection_name)
-                print(f"Loaded existing collection: {collection_name}")
-            except Exception:
-                self.collection = self.chroma_client.create_collection(
-                    name=collection_name,
-                    metadata={"hnsw:space": "cosine"}
-                )
-                print(f"Created new collection: {collection_name}")
-        else:
-            print("Warning: chromadb is not installed. Using BM25-only retrieval mode.")
-            self.vector_weight = 0.0
-            self.bm25_weight = 1.0
-
+        # BM25 index
         self.bm25_index = None
         self.bm25_docs = []
         self.bm25_index_path = persist_dir / f"{collection_name}_bm25.pkl"
+
+        # Load BM25 index if exists
         self._load_bm25_index()
 
     def index_documents(self, documents: List[Document]):
@@ -100,6 +98,7 @@ class HybridRetriever:
 
         print(f"Indexing {len(documents)} documents...")
 
+        # Prepare data for ChromaDB
         ids = []
         contents = []
         embeddings = []
@@ -117,26 +116,25 @@ class HybridRetriever:
                 'source_type': doc.source_type.value if hasattr(doc.source_type, 'value') else str(doc.source_type),
             }
             for key, value in doc.metadata.items():
-                metadata[key] = value if isinstance(value, (str, int, float, bool)) else str(value)
+                if isinstance(value, (str, int, float, bool)):
+                    metadata[key] = value
+                else:
+                    metadata[key] = str(value)
+
             metadatas.append(metadata)
 
-        if self.chroma_available and self.collection is not None:
-            batch_size = self.config['embedding']['batch_size']
-            for i in range(0, len(contents), batch_size):
-                batch = contents[i:i + batch_size]
-                batch_embeddings = self.embedding_model.encode(
-                    batch,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                )
-                embeddings.extend(batch_embeddings.tolist())
-
-            self.collection.add(
-                ids=ids,
-                embeddings=embeddings,
-                documents=contents,
-                metadatas=metadatas,
+        # Generate embeddings in batches
+        batch_size = self.config['embedding']['batch_size']
+        for i in range(0, len(contents), batch_size):
+            batch = contents[i:i + batch_size]
+            batch_embeddings = self.embedding_model.encode(
+                batch,
+                show_progress_bar=False,
+                convert_to_numpy=True
             )
+            embeddings.extend(batch_embeddings.tolist())
+
+        self.collection.add(ids=ids, embeddings=embeddings, documents=contents, metadatas=metadatas)
 
         self.bm25_docs.extend(documents)
         self.bm25_index = BM25Okapi([doc.content.lower().split() for doc in self.bm25_docs])
@@ -145,7 +143,7 @@ class HybridRetriever:
         print(f"Indexed {len(documents)} documents successfully")
 
     def retrieve(self, query: str, top_k: Optional[int] = None) -> List[RetrievalResult]:
-        """Hybrid retrieval using BM25 + Vector search."""
+        """Hybrid retrieval using BM25 + Vector search with optional reranking and cache."""
         if top_k is None:
             top_k = self.top_k
 
@@ -154,7 +152,27 @@ class HybridRetriever:
             if cached_results is not None:
                 return cached_results[:top_k]
 
-        retrieval_pool_size = top_k * self.rerank_candidates_multiplier if self.enable_reranking else top_k
+        retrieval_pool_size = top_k
+        if self.enable_reranking:
+            retrieval_pool_size = top_k * self.rerank_candidates_multiplier
+        
+        # Vector search via ChromaDB
+        query_embedding_np = self.embedding_model.encode([query], convert_to_numpy=True)[0]
+
+        if self.semantic_cache is not None:
+            cached_results = self.semantic_cache.get(query, query_embedding_np)
+            if cached_results is not None:
+                return cached_results[:top_k]
+
+        query_embedding = query_embedding_np.tolist()
+
+        candidate_multiplier = self.reranking_config.get('candidate_multiplier', 2)
+        n_candidates = min(max(top_k * candidate_multiplier, top_k), len(self.bm25_docs))
+        
+        vector_results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(retrieval_pool_size * 2, len(self.bm25_docs))  # Get more for fusion
+        )
 
         bm25_scores = {}
         if self.bm25_index is not None:
@@ -162,44 +180,55 @@ class HybridRetriever:
             scores = self.bm25_index.get_scores(tokenized_query)
             for i, score in enumerate(scores):
                 doc = self.bm25_docs[i]
-                bm25_scores[f"{doc.doc_id}_{doc.chunk_id}"] = float(score)
+                doc_id = f"{doc.doc_id}_{doc.chunk_id}"
+                bm25_scores[doc_id] = score
 
         combined_scores = {}
-
-        if self.chroma_available and self.collection is not None and self.bm25_docs:
-            query_embedding = self.embedding_model.encode([query], convert_to_numpy=True)[0].tolist()
-            vector_results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=min(retrieval_pool_size * 2, len(self.bm25_docs)),
-            )
-
-            for i, doc_id in enumerate(vector_results['ids'][0]):
-                distance = vector_results['distances'][0][i]
-                vector_score = 1 / (1 + distance)
-                combined_scores[doc_id] = self.vector_weight * vector_score
+        for i, doc_id in enumerate(vector_results['ids'][0]):
+            distance = vector_results['distances'][0][i]
+            vector_score = 1 / (1 + distance)
+            combined_scores[doc_id] = self.vector_weight * vector_score
 
         if bm25_scores:
-            max_bm25 = max(bm25_scores.values()) if bm25_scores else 1
+            max_bm25 = max(bm25_scores.values())
             for doc_id, score in bm25_scores.items():
                 normalized_score = score / max_bm25 if max_bm25 > 0 else 0
-                combined_scores[doc_id] = combined_scores.get(doc_id, 0) + self.bm25_weight * normalized_score
-
+                if doc_id in combined_scores:
+                    combined_scores[doc_id] += self.bm25_weight * normalized_score
+                else:
+                    combined_scores[doc_id] = self.bm25_weight * normalized_score
+        
         sorted_doc_ids = sorted(combined_scores.keys(), key=lambda x: combined_scores[x], reverse=True)
 
+        if self.cross_encoder is not None and sorted_doc_ids:
+            sorted_doc_ids = self._rerank_with_cross_encoder(
+                query=query,
+                sorted_doc_ids=sorted_doc_ids,
+                combined_scores=combined_scores,
+                top_k=top_k
+            )
+        
+        # Convert to RetrievalResult objects
         results = []
         for rank, doc_id in enumerate(sorted_doc_ids[:retrieval_pool_size]):
+            # Find document
             doc = self._find_document_by_id(doc_id)
             if doc:
-                results.append(RetrievalResult(document=doc, score=combined_scores[doc_id], rank=rank + 1))
+                candidates.append(
+                    RetrievalResult(document=doc, score=combined_scores[doc_id], rank=rank + 1)
+                )
+                results.append(result)
 
         if self.enable_reranking and self.cross_encoder and len(results) > top_k:
             pairs = [[query, r.document.content] for r in results]
             rerank_scores = self.cross_encoder.predict(pairs)
+
             for i, rerank_score in enumerate(rerank_scores):
                 results[i].score = (
                     (1.0 - self.rerank_weight) * results[i].score
                     + self.rerank_weight * float(rerank_score)
                 )
+
             results.sort(key=lambda x: x.score, reverse=True)
 
         final_results = []
@@ -211,6 +240,29 @@ class HybridRetriever:
             self.semantic_cache.put(query, final_results)
 
         return final_results
+    
+    def _rerank_results(self, query: str, candidates: List[RetrievalResult], top_k: int) -> List[RetrievalResult]:
+        """Rerank candidates with a cross-encoder and blend scores."""
+        pairs = [[query, c.document.content] for c in candidates]
+        rerank_scores = self.cross_encoder.predict(pairs)
+
+        if len(rerank_scores) > 0:
+            min_score = float(np.min(rerank_scores))
+            max_score = float(np.max(rerank_scores))
+            denom = (max_score - min_score) if max_score != min_score else 1.0
+        else:
+            min_score = 0.0
+            denom = 1.0
+
+        for i, candidate in enumerate(candidates):
+            normalized_rerank = (float(rerank_scores[i]) - min_score) / denom
+            candidate.score = ((1 - self.rerank_weight) * candidate.score) + (self.rerank_weight * normalized_rerank)
+
+        candidates.sort(key=lambda x: x.score, reverse=True)
+        reranked = candidates[:top_k]
+        for rank, result in enumerate(reranked, start=1):
+            result.rank = rank
+        return reranked
 
     def _find_document_by_id(self, full_doc_id: str) -> Optional[Document]:
         for doc in self.bm25_docs:
@@ -219,10 +271,7 @@ class HybridRetriever:
         return None
 
     def _save_bm25_index(self):
-        data = {
-            'index': self.bm25_index,
-            'docs': self.bm25_docs,
-        }
+        data = {'index': self.bm25_index, 'docs': self.bm25_docs}
         with open(self.bm25_index_path, 'wb') as f:
             pickle.dump(data, f)
 
@@ -238,17 +287,16 @@ class HybridRetriever:
                 print(f"Failed to load BM25 index: {e}")
 
     def clear_collection(self):
-        if self.chroma_available and self.chroma_client is not None:
-            try:
-                self.chroma_client.delete_collection(name=self.collection_name)
-                print(f"Deleted collection: {self.collection_name}")
-            except Exception:
-                pass
+        try:
+            self.chroma_client.delete_collection(name=self.collection_name)
+            print(f"Deleted collection: {self.collection_name}")
+        except Exception:
+            pass
 
-            self.collection = self.chroma_client.create_collection(
-                name=self.collection_name,
-                metadata={"hnsw:space": "cosine"},
-            )
+        self.collection = self.chroma_client.create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
 
         self.bm25_index = None
         self.bm25_docs = []
@@ -257,7 +305,7 @@ class HybridRetriever:
 
 
 if __name__ == "__main__":
-    from indexing.schema import Document, DocumentType, SourceType
+    from indexing.schema import DocumentType, SourceType
 
     retriever = HybridRetriever("test_collection")
     retriever.clear_collection()
@@ -282,6 +330,7 @@ if __name__ == "__main__":
     ]
 
     retriever.index_documents(docs)
+
     results = retriever.retrieve("What was Apple's revenue?", top_k=2)
 
     print(f"Found {len(results)} results:")

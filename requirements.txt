@@ -1,5 +1,5 @@
 # Core config and data models
-pyyaml>=6.0
+PyYAML>=6.0
 pydantic>=2.0
 python-dotenv>=1.0
 
@@ -8,6 +8,7 @@ anthropic>=0.34.0
 openai>=1.40.0
 
 # Retrieval and embeddings
+chromadb>=0.5.5
 sentence-transformers>=3.0.0
 rank-bm25>=0.2.2
 
@@ -20,8 +21,3 @@ markdownify>=0.13.1
 numpy>=1.26.0
 matplotlib>=3.8.0
 tqdm>=4.66.0
-
-# Optional (vector DB backend)
-# Install when you want Chroma vector search instead of BM25-only fallback.
-chromadb==0.4.24 ; platform_system != "Windows"
-
