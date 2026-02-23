@@ -37,7 +37,8 @@ A research-grade Financial Question Answering system that implements:
 cd finrag_pot
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+python scripts/check_env.py
 ```
 
 ### 2. Configure Environment
@@ -65,6 +66,68 @@ mkdir -p data/finqa
 # Place train.json, validation.json, test.json in data/finqa/
 ```
 
+## Troubleshooting
+
+If `app.py` fails very early with missing package errors, run the preflight checker:
+
+```bash
+python scripts/check_env.py
+```
+
+If you see this error:
+
+```python
+import yaml
+ModuleNotFoundError: No module named 'yaml'
+```
+
+Install project dependencies in your active environment:
+
+```bash
+python -m pip install -r requirements.txt
+python scripts/check_env.py
+```
+
+Or install only YAML support quickly:
+
+```bash
+python -m pip install pyyaml
+```
+
+If dependency install fails while building `chromadb` on Windows (Rust/maturin errors), you can still run the project in BM25-only retrieval mode:
+
+```bash
+python -m pip install -r requirements.txt
+python scripts/check_env.py
+```
+
+`HybridRetriever` now automatically falls back to BM25-only retrieval when `chromadb` is unavailable.
+
+If you see this error:
+
+```python
+ModuleNotFoundError: No module named 'pydantic'
+```
+
+Install dependencies into the same Python interpreter used to run the app:
+
+```bash
+python -m pip install -r requirements.txt
+python scripts/check_env.py
+```
+
+Or install only pydantic quickly:
+
+```bash
+python -m pip install pydantic
+```
+
+You can verify installation with:
+
+```bash
+python -c "import yaml, pydantic; print('ok')"
+```
+
 ## Usage
 
 ### Mode 1: FinQA Benchmark Evaluation
@@ -81,10 +144,13 @@ python app.py --mode finqa \
 #### Run Full Evaluation
 
 ```bash
-# Evaluate on validation set
+# Evaluate on validation set (multiline)
 python app.py --mode eval \
   --eval-split validation \
   --num-examples 100
+
+# Or one-line (safer to copy on Windows terminals)
+python app.py --mode eval --eval-split validation --num-examples 100
 ```
 
 This will:
@@ -356,6 +422,12 @@ Verification: ✓ All numbers verified in source documents
 ```
 
 ## Troubleshooting
+
+If `app.py` fails very early with missing package errors, run the preflight checker:
+
+```bash
+python scripts/check_env.py
+```
 
 ### ChromaDB Issues
 ```bash
