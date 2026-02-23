@@ -14,8 +14,9 @@ source venv/bin/activate
 
 # Install dependencies
 echo "Installing dependencies..."
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python scripts/check_env.py
 
 # Create data directories
 echo "Creating data directories..."

@@ -92,7 +92,7 @@ class HybridRetriever:
         self._load_bm25_index()
 
     def index_documents(self, documents: List[Document]):
-        """Index documents for hybrid retrieval"""
+        """Index documents for hybrid retrieval."""
         if not documents:
             return
 
@@ -317,7 +317,7 @@ if __name__ == "__main__":
             content="Apple reported revenue of $394.3 billion in fiscal 2022.",
             doc_type=DocumentType.TEXT,
             source_type=SourceType.FINQA,
-            metadata={}
+            metadata={},
         ),
         Document(
             doc_id="doc2",
@@ -325,7 +325,7 @@ if __name__ == "__main__":
             content="Microsoft's revenue grew by 18% year over year.",
             doc_type=DocumentType.TEXT,
             source_type=SourceType.FINQA,
-            metadata={}
+            metadata={},
         ),
     ]
 
@@ -334,5 +334,5 @@ if __name__ == "__main__":
     results = retriever.retrieve("What was Apple's revenue?", top_k=2)
 
     print(f"Found {len(results)} results:")
-    for r in results:
-        print(f"Score: {r.score:.3f}, Content: {r.document.content}")
+    for result in results:
+        print(f"Score: {result.score:.3f}, Content: {result.document.content}")
