@@ -57,6 +57,13 @@ OPENAI_API_KEY=your_key_here
 EDGAR_USER_AGENT=YourName your.email@example.com
 ```
 
+
+Optional: install ChromaDB for production-scale vector persistence:
+
+```bash
+python -m pip install chromadb
+```
+
 ### 3. Download FinQA Dataset
 
 Download from: https://github.com/czyssrs/FinQA
@@ -94,14 +101,14 @@ Or install only YAML support quickly:
 python -m pip install pyyaml
 ```
 
-If dependency install fails while building `chromadb` on Windows (Rust/maturin errors), you can still run the project in BM25-only retrieval mode:
+The default setup avoids `chromadb` so it works on Windows/Python 3.11+ without Rust toolchain issues:
 
 ```bash
 python -m pip install -r requirements.txt
 python scripts/check_env.py
 ```
 
-`HybridRetriever` now automatically falls back to BM25-only retrieval when `chromadb` is unavailable.
+`HybridRetriever` now uses a built-in NumPy vector store by default and still supports ChromaDB automatically when it is installed.
 
 If you see this error:
 
