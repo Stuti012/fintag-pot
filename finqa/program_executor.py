@@ -36,7 +36,11 @@ class ProgramExecutor:
         'max': lambda *args: max(args[0]) if isinstance(args[0], list) else max(args),
         'min': lambda *args: min(args[0]) if isinstance(args[0], list) else min(args),
         'sum': lambda *args: sum(args[0]) if isinstance(args[0], list) else sum(args),
-        'avg': lambda *args: sum(args[0]) / len(args[0]) if isinstance(args[0], list) and len(args[0]) > 0 else 0
+        'avg': lambda *args: (
+            sum(args[0]) / len(args[0])
+            if args and isinstance(args[0], list)
+            else (sum(args) / len(args) if args else 0)
+        )
     }
     
     def __init__(self, timeout_seconds: int = 5):
@@ -185,14 +189,11 @@ class ProgramExecutor:
     
     def verify_program(self, program_text: str, available_numbers: List[float]) -> Tuple[bool, str]:
         """Verify that program only uses available numbers"""
-        # Extract all constant numbers from program
         lines = self.parse_program(program_text)
         used_numbers = []
         
         for line in lines:
-            # Find all numeric constants
-            numbers = re.findall(r'-?\d+\.?\d*', line)
-            used_numbers.extend([float(n) for n in numbers])
+            used_numbers.extend(self._extract_numeric_literals(line))
         
         # Check if all used numbers are available
         tolerance = 1e-6
@@ -207,6 +208,55 @@ class ProgramExecutor:
                 return False, f"Number {num} not found in evidence"
         
         return True, "All numbers verified"
+
+    def _extract_numeric_literals(self, line: str) -> List[float]:
+        """Extract numeric literals used in a program line.
+
+        This avoids false positives from variable names like `const_0`.
+        """
+        if '=' not in line:
+            return []
+
+        _, expression = line.split('=', 1)
+        expression = expression.strip()
+
+        # Direct assignment: x = 42.0
+        try:
+            return [float(expression)]
+        except ValueError:
+            pass
+
+        # Operation call: x = add(a, 10)
+        match = re.match(r'(\w+)\((.*)\)', expression)
+        if not match:
+            return []
+
+        args_str = match.group(2).strip()
+        if not args_str:
+            return []
+
+        numeric_literals = []
+
+        def _append_if_number(token: str):
+            token = token.strip()
+            if not token:
+                return
+            try:
+                numeric_literals.append(float(token))
+            except ValueError:
+                # Variable references are expected and ignored.
+                return
+
+        # List argument: [a, 1, 2]
+        if args_str.startswith('[') and args_str.endswith(']'):
+            for item in args_str[1:-1].split(','):
+                _append_if_number(item)
+            return numeric_literals
+
+        for arg in args_str.split(','):
+            _append_if_number(arg)
+
+        return numeric_literals
     
     def extract_reasoning_and_program(self, llm_output: str) -> Tuple[str, str]:
         """Extract reasoning and program from LLM output"""
