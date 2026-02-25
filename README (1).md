@@ -41,6 +41,12 @@ python -m pip install -r requirements.txt
 python scripts/check_env.py
 ```
 
+Optional (higher-quality semantic embeddings + ChromaDB persistence):
+
+```bash
+python -m pip install -r requirements-optional.txt
+```
+
 ### 2. Configure Environment
 
 ```bash
@@ -58,11 +64,7 @@ EDGAR_USER_AGENT=YourName your.email@example.com
 ```
 
 
-Optional: install ChromaDB for production-scale vector persistence:
-
-```bash
-python -m pip install chromadb
-```
+If optional dependencies are not installed, the app still runs using a built-in lightweight hashing embedding fallback and a NumPy vector store.
 
 ### 3. Download FinQA Dataset
 
@@ -109,6 +111,14 @@ python scripts/check_env.py
 ```
 
 `HybridRetriever` now uses a built-in NumPy vector store by default and still supports ChromaDB automatically when it is installed.
+
+If installation fails with messages involving `ninja`, `cmake`, or SSL certificate verification (common on restricted Windows environments), use the base requirements only:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Then install optional dependencies later when certificate/toolchain access is available.
 
 If you see this error:
 

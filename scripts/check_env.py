@@ -12,6 +12,7 @@ REQUIRED_MODULES = {
 
 OPTIONAL_MODULES = {
     "chromadb": "chromadb",
+    "sentence_transformers": "sentence-transformers",
 }
 
 

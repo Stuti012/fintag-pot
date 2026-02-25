@@ -1,0 +1,5 @@
+# Optional retrieval quality/performance packages.
+# Install only when your environment supports these heavier dependencies.
+
+sentence-transformers>=3.0.0
+chromadb>=0.5.0
