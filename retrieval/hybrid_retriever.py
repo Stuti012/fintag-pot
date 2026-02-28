@@ -7,7 +7,13 @@ from typing import Dict, List, Optional
 import numpy as np
 import yaml
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+import hashlib
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - optional dependency
+    SentenceTransformer = None
+
 
 from indexing.schema import Document, RetrievalResult
 from retrieval.semantic_cache import SemanticCache
@@ -97,6 +103,30 @@ class _NumpyVectorStore:
             self.persist_path.unlink()
 
 
+class _HashingSentenceTransformerFallback:
+    """Deterministic, lightweight embedding fallback."""
+
+    def __init__(self, dim: int = 256):
+        self.dim = dim
+
+    def _encode_single(self, text: str) -> np.ndarray:
+        vector = np.zeros(self.dim, dtype=np.float32)
+        for token in text.lower().split():
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:4], "big") % self.dim
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vector[index] += sign
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector /= norm
+        return vector
+
+    def encode(self, texts: List[str], show_progress_bar: bool = False, convert_to_numpy: bool = True):
+        _ = show_progress_bar
+        embeddings = np.vstack([self._encode_single(text) for text in texts])
+        return embeddings if convert_to_numpy else embeddings.tolist()
+
+
 class HybridRetriever:
     """Hybrid retrieval using BM25 + vector search with optional reranking/cache."""
 
@@ -121,7 +151,13 @@ class HybridRetriever:
         self.semantic_cache_threshold = semantic_cfg.get("threshold", 0.95)
 
         print(f"Loading embedding model: {self.config['embedding']['model']}")
-        self.embedding_model = SentenceTransformer(self.config["embedding"]["model"])
+        if SentenceTransformer is None:
+            print("Warning: sentence-transformers not installed; using hashing embedding fallback")
+            self.embedding_model = _HashingSentenceTransformerFallback(
+                dim=self.config["embedding"].get("fallback_dim", 256)
+            )
+        else:
+            self.embedding_model = SentenceTransformer(self.config["embedding"]["model"])
 
         self.cross_encoder = None
         if self.enable_reranking:

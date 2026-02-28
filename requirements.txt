@@ -7,8 +7,7 @@ python-dotenv>=1.0
 anthropic>=0.34.0
 openai>=1.40.0
 
-# Retrieval and embeddings
-sentence-transformers>=3.0.0
+# Retrieval and basic numeric stack
 rank-bm25>=0.2.2
 numpy>=1.26.0
 
